@@ -1,0 +1,44 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor and IDE state
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+config.json
+*.pem
+*.key
+
+# Go build and test outputs
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+*.coverprofile
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Logs and temporary files
+*.log
+tmp/
+.tmp/
+.cache/ 
+ 
