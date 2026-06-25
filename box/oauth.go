@@ -3,6 +3,7 @@ package box
 import (
 	"context"
 	"strings"
+	"sync"
 
 	boxerrors "github.com/asalih/go-box-sdk/errors"
 	"github.com/asalih/go-box-sdk/managers"
@@ -29,10 +30,16 @@ type GetAuthorizeURLOptions struct {
 }
 
 // BoxOAuth authenticates using the OAuth2 authorization-code grant. It mirrors
-// BoxOAuth and implements networking.Authentication.
+// BoxOAuth and implements networking.Authentication. A BoxOAuth must not be
+// copied after first use: it holds a mutex that serializes token refresh. Use
+// it through a pointer (as the New* constructor returns).
 type BoxOAuth struct {
 	Config       OAuthConfig
 	TokenStorage TokenStorage
+	// mu serializes token refresh. This is critical for OAuth: Box rotates
+	// refresh tokens (each is single-use), so unsynchronized concurrent
+	// refreshes would race to consume the same refresh token and fail.
+	mu sync.Mutex
 }
 
 // NewBoxOAuth builds a BoxOAuth from the given config.
@@ -98,9 +105,23 @@ func (a *BoxOAuth) RetrieveToken(ctx context.Context, session *networking.Networ
 }
 
 // RefreshToken obtains a new access token using the stored refresh token and
-// stores the result. It mirrors refreshToken.
+// stores the result. It mirrors refreshToken. Concurrent calls are serialized:
+// a caller that blocks while another goroutine refreshes returns that fresh
+// token rather than re-using the now-consumed refresh token.
 func (a *BoxOAuth) RefreshToken(ctx context.Context, session *networking.NetworkSession) (*schemas.AccessToken, error) {
 	oldToken := a.TokenStorage.Get()
+	before := ""
+	if oldToken != nil {
+		before = oldToken.AccessToken
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// Another goroutine may have refreshed while we waited for the lock. Re-read
+	// before consuming the (single-use) refresh token.
+	oldToken = a.TokenStorage.Get()
+	if oldToken != nil && oldToken.AccessToken != before {
+		return oldToken, nil
+	}
 	refreshToken := ""
 	if oldToken != nil {
 		refreshToken = oldToken.RefreshToken

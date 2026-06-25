@@ -3,6 +3,7 @@ package box
 import (
 	"context"
 	"strings"
+	"sync"
 
 	boxerrors "github.com/asalih/go-box-sdk/errors"
 	"github.com/asalih/go-box-sdk/managers"
@@ -21,12 +22,17 @@ type CcgConfig struct {
 }
 
 // BoxCcgAuth authenticates using the Client Credentials Grant. It mirrors
-// BoxCcgAuth and implements networking.Authentication.
+// BoxCcgAuth and implements networking.Authentication. A BoxCcgAuth must not be
+// copied after first use: it holds a mutex that serializes token refresh. Use
+// it through a pointer (as the New* constructors return).
 type BoxCcgAuth struct {
 	Config       CcgConfig
 	TokenStorage TokenStorage
 	SubjectID    string
 	SubjectType  string
+	// mu serializes token refresh so concurrent callers collapse into a single
+	// network request instead of stampeding the token endpoint.
+	mu sync.Mutex
 }
 
 // NewBoxCcgAuth builds a BoxCcgAuth from the given config. The subject defaults
@@ -50,8 +56,20 @@ func NewBoxCcgAuth(config CcgConfig) *BoxCcgAuth {
 }
 
 // RefreshToken fetches a new access token using the client-credentials grant
-// and stores it.
+// and stores it. Concurrent calls are serialized: a caller that blocks while
+// another goroutine refreshes returns that fresh token without issuing a
+// second request.
 func (a *BoxCcgAuth) RefreshToken(ctx context.Context, session *networking.NetworkSession) (*schemas.AccessToken, error) {
+	var before string
+	if t := a.TokenStorage.Get(); t != nil {
+		before = t.AccessToken
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// Another goroutine may have refreshed while we waited for the lock.
+	if cur := a.TokenStorage.Get(); cur != nil && cur.AccessToken != before {
+		return cur, nil
+	}
 	authManager := managers.NewAuthorizationManager(nil, sessionOrDefault(session))
 	token, err := authManager.RequestAccessToken(ctx, &schemas.PostOAuth2Token{
 		GrantType:      schemas.GrantTypeClientCredentials,

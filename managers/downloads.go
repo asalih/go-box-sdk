@@ -51,9 +51,9 @@ func (o *DownloadFileOptions) headers() map[string]string {
 
 // DownloadFile returns the contents of a file as a stream. A nil reader is
 // returned when the server responds 202 (content not yet ready). It mirrors
-// downloadFile. The caller is responsible for closing the returned stream when
-// it implements io.Closer.
-func (m *DownloadsManager) DownloadFile(ctx context.Context, fileID string, opts *DownloadFileOptions) (io.Reader, error) {
+// downloadFile. The caller MUST Close the returned stream to release the
+// underlying connection and request context; failing to do so leaks both.
+func (m *DownloadsManager) DownloadFile(ctx context.Context, fileID string, opts *DownloadFileOptions) (io.ReadCloser, error) {
 	resp, err := m.fetch(ctx, &networking.FetchOptions{
 		URL:            m.NetworkSession.BaseURLs.BaseURL + "/2.0/files/" + fileID + "/content",
 		Method:         http.MethodGet,
@@ -67,7 +67,10 @@ func (m *DownloadsManager) DownloadFile(ctx context.Context, fileID string, opts
 	if resp.Status == 202 {
 		return nil, nil
 	}
-	return resp.Content, nil
+	if rc, ok := resp.Content.(io.ReadCloser); ok {
+		return rc, nil
+	}
+	return io.NopCloser(resp.Content), nil
 }
 
 // GetDownloadFileURL returns the redirect location for a file's content without

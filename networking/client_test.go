@@ -2,11 +2,14 @@ package networking
 
 import (
 	"context"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	boxerrors "github.com/asalih/go-box-sdk/errors"
 	"github.com/asalih/go-box-sdk/schemas"
@@ -500,4 +503,97 @@ func TestRetryAfterExponentialBackoff(t *testing.T) {
 	for attempt := 1; attempt < 5; attempt++ {
 		assert.Greater(t, strategy.RetryAfter(&FetchOptions{}, resp, attempt), 0.0)
 	}
+}
+
+func TestPrepareOctetStreamBody(t *testing.T) {
+	rt := &mockTransport{seq: []responder{respond(200, `{}`, nil)}}
+	client := newTestClient(rt)
+
+	_, err := client.Fetch(context.Background(), &FetchOptions{
+		Method:         http.MethodPut,
+		URL:            "https://example.com/upload",
+		FileStream:     strings.NewReader("octet-bytes"),
+		ContentType:    ContentTypeOctetStream,
+		ResponseFormat: ResponseFormatJSON,
+		NetworkSession: NewNetworkSession(),
+	})
+	require.NoError(t, err)
+	require.Len(t, rt.reqs, 1)
+	assert.Equal(t, "octet-bytes", rt.reqs[0].body)
+	assert.Equal(t, ContentTypeOctetStream, rt.reqs[0].headers["Content-Type"])
+}
+
+func TestPrepareOctetStreamRequiresFileStream(t *testing.T) {
+	rt := &mockTransport{seq: []responder{respond(200, `{}`, nil)}}
+	client := newTestClient(rt)
+
+	_, err := client.Fetch(context.Background(), &FetchOptions{
+		Method:         http.MethodPut,
+		URL:            "https://example.com/upload",
+		ContentType:    ContentTypeOctetStream,
+		NetworkSession: NewNetworkSession(),
+	})
+	require.Error(t, err)
+}
+
+func TestMultipartSetsContentMD5(t *testing.T) {
+	rt := &mockTransport{seq: []responder{respond(200, `{}`, nil)}}
+	client := newTestClient(rt)
+	fileContent := "evidence-bytes"
+
+	_, err := client.Fetch(context.Background(), &FetchOptions{
+		Method: http.MethodPost,
+		URL:    "https://example.com/content",
+		MultipartData: []MultipartItem{
+			{PartName: "attributes", Data: map[string]any{"name": "f"}},
+			{PartName: "file", FileStream: strings.NewReader(fileContent), FileName: "f"},
+		},
+		ContentType:    ContentTypeMultipartForm,
+		ResponseFormat: ResponseFormatJSON,
+		NetworkSession: NewNetworkSession(),
+	})
+	require.NoError(t, err)
+	require.Len(t, rt.reqs, 1)
+	// content-md5 is the lowercase hex SHA1 of the file part content.
+	expected := fmt.Sprintf("%x", sha1.Sum([]byte(fileContent)))
+	assert.Equal(t, expected, rt.reqs[0].headers["Content-Md5"])
+	assert.True(t, strings.HasPrefix(rt.reqs[0].headers["Content-Type"], "multipart/form-data"))
+}
+
+func TestPerRequestTimeout(t *testing.T) {
+	// The server blocks until the client's request context is canceled.
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	session := NewNetworkSession()
+	session.RetryStrategy = &BoxRetryStrategy{MaxAttempts: 5, RetryRandomizationFactor: 0.5, RetryBaseInterval: 0, MaxRetriesOnException: 0}
+	session.TimeoutConfig = &TimeoutConfig{TimeoutMs: 50}
+
+	_, err := NewBoxNetworkClient().Fetch(context.Background(), &FetchOptions{
+		Method:         http.MethodGet,
+		URL:            srv.URL,
+		NetworkSession: session,
+	})
+	var sdkErr *boxerrors.BoxSDKError
+	require.ErrorAs(t, err, &sdkErr)
+	assert.Contains(t, sdkErr.Message, "Connection timeout after 50ms")
+}
+
+func TestSleepContext(t *testing.T) {
+	// Zero (or negative) delay returns immediately.
+	require.NoError(t, sleepContext(context.Background(), 0))
+
+	// A canceled context short-circuits the wait and returns its error.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := sleepContext(ctx, 10)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// A small positive delay elapses normally.
+	require.NoError(t, sleepContext(context.Background(), 0.001))
 }

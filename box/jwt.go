@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	boxerrors "github.com/asalih/go-box-sdk/errors"
 	"github.com/asalih/go-box-sdk/internal/utils"
@@ -85,12 +86,17 @@ func JwtConfigFromConfigFile(configFilePath string, tokenStorage TokenStorage, d
 }
 
 // BoxJwtAuth authenticates using a signed JWT assertion. It mirrors BoxJwtAuth
-// and implements networking.Authentication.
+// and implements networking.Authentication. A BoxJwtAuth must not be copied
+// after first use: it holds a mutex that serializes token refresh. Use it
+// through a pointer (as the New* constructors return).
 type BoxJwtAuth struct {
 	Config       JwtConfig
 	TokenStorage TokenStorage
 	SubjectID    string
 	SubjectType  string
+	// mu serializes token refresh so concurrent callers collapse into a single
+	// network request instead of stampeding the token endpoint.
+	mu sync.Mutex
 }
 
 // NewBoxJwtAuth builds a BoxJwtAuth from the given config. The subject defaults
@@ -120,8 +126,20 @@ func NewBoxJwtAuth(config JwtConfig) *BoxJwtAuth {
 }
 
 // RefreshToken signs a fresh JWT assertion, exchanges it for an access token,
-// and stores the token.
+// and stores the token. Concurrent calls are serialized: a caller that blocks
+// while another goroutine refreshes returns that fresh token without signing a
+// new assertion or issuing a second request.
 func (a *BoxJwtAuth) RefreshToken(ctx context.Context, session *networking.NetworkSession) (*schemas.AccessToken, error) {
+	var before string
+	if t := a.TokenStorage.Get(); t != nil {
+		before = t.AccessToken
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// Another goroutine may have refreshed while we waited for the lock.
+	if cur := a.TokenStorage.Get(); cur != nil && cur.AccessToken != before {
+		return cur, nil
+	}
 	claims := map[string]any{
 		"exp":          utils.GetEpochTimeInSeconds() + 30,
 		"box_sub_type": a.SubjectType,
