@@ -129,6 +129,7 @@ func TestIntegrationUploadDownload(t *testing.T) {
 	stream, err := client.Downloads.DownloadFile(ctx, fileID, nil)
 	require.NoError(t, err)
 	require.NotNil(t, stream)
+	defer stream.Close()
 	downloaded, err := io.ReadAll(stream)
 	require.NoError(t, err)
 	assert.Equal(t, content, downloaded)
